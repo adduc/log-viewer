@@ -49,6 +49,8 @@ trait CanCacheData
 
         $size += $this->index()->cacheSize();
 
+        $size += $this->decompressedCopiesSize();
+
         return $size;
     }
 

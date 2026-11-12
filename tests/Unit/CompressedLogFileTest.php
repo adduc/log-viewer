@@ -101,6 +101,60 @@ it('discovers gzip files matching include patterns', function () {
     expect($names)->toBe(['laravel.log', 'laravel.log.1.gz']);
 });
 
+it('includes the decompressed copy in the cache size', function () {
+    $content = str_repeat(makeLaravelLogEntry().PHP_EOL, 50);
+    $file = generateGzipLogFile('laravel.log.6.gz', $content);
+
+    $sizeBefore = $file->cacheSize();
+    $file->readablePath();
+
+    expect($file->decompressedCopiesSize())->toBe(strlen($content))
+        ->and($file->cacheSize())->toBe($sizeBefore + strlen($content));
+});
+
+it('prunes decompressed copies unused for longer than the TTL', function () {
+    $stale = generateGzipLogFile('laravel.log.7.gz', makeLaravelLogEntry());
+    $fresh = generateGzipLogFile('laravel.log.8.gz', makeLaravelLogEntry());
+    $staleCopy = $stale->readablePath();
+    $freshCopy = $fresh->readablePath();
+    $orphanTemp = LogFile::decompressedDirectory().'/abc-1-1.log.deadbeef.tmp';
+    touch($orphanTemp);
+
+    $longAgo = time() - LogFile::decompressedCopyTtl() - 60;
+    touch($staleCopy, $longAgo);
+    touch($orphanTemp, $longAgo);
+
+    expect(LogFile::pruneDecompressedCopies())->toBe(2)
+        ->and(file_exists($staleCopy))->toBeFalse()
+        ->and(file_exists($orphanTemp))->toBeFalse()
+        ->and(file_exists($freshCopy))->toBeTrue();
+
+    // A pruned copy is transparently recreated on next use.
+    expect(file_get_contents($stale->readablePath()))->toContain('Testing log entry');
+});
+
+it('refreshes the last-used time when an old copy is read', function () {
+    $file = generateGzipLogFile('laravel.log.9.gz', makeLaravelLogEntry());
+    $copy = $file->readablePath();
+    touch($copy, $twoHoursAgo = time() - 7200);
+    clearstatcache();
+
+    $file->readablePath();
+    clearstatcache();
+
+    expect(filemtime($copy))->toBeGreaterThan($twoHoursAgo);
+});
+
+it('prunes stale copies when listing files', function () {
+    $file = generateGzipLogFile('laravel.log.10.gz', makeLaravelLogEntry());
+    $copy = $file->readablePath();
+    touch($copy, time() - LogFile::decompressedCopyTtl() - 60);
+
+    LogViewer::getFiles();
+
+    expect(file_exists($copy))->toBeFalse();
+});
+
 it('leaves uncompressed files untouched', function () {
     $file = generateLogFile('plain.log', makeLaravelLogEntry());
 

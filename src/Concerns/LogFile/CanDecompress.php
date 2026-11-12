@@ -45,6 +45,11 @@ trait CanDecompress
 
         if (! is_file($target)) {
             $this->decompressTo($target);
+        } elseif (filemtime($target) < time() - 3600) {
+            // The copy's mtime records when it was last used, so pruning can find
+            // copies nobody has opened recently. Only touch it hourly to avoid a
+            // filesystem write on every request.
+            @touch($target);
         }
 
         return $target;
@@ -169,6 +174,64 @@ trait CanDecompress
         $this->deleteDecompressedCopies();
 
         rename($temp, $target);
+
+        // Disk usage just grew, so this is a good time to drop unused copies.
+        static::pruneDecompressedCopies();
+    }
+
+    /**
+     * Total size of this file's decompressed copies on disk, in bytes.
+     */
+    public function decompressedCopiesSize(): int
+    {
+        if (! $this->isCompressed()) {
+            return 0;
+        }
+
+        return array_sum(array_map(
+            fn (string $copy) => @filesize($copy) ?: 0,
+            $this->decompressedCopies(),
+        ));
+    }
+
+    /**
+     * How long a decompressed copy may go unused before it is pruned.
+     * Matches the one-week TTL used for cached indices (see CanCacheData::cacheTtl()).
+     */
+    public static function decompressedCopyTtl(): int
+    {
+        return 7 * 24 * 60 * 60;
+    }
+
+    /**
+     * Delete decompressed copies (and leftover temp files from interrupted
+     * decompressions) that have not been used within the TTL.
+     *
+     * @return int Number of files deleted.
+     */
+    public static function pruneDecompressedCopies(): int
+    {
+        $directory = static::decompressedDirectory();
+
+        if (! is_dir($directory)) {
+            return 0;
+        }
+
+        $cutoff = time() - static::decompressedCopyTtl();
+        $deleted = 0;
+
+        foreach (glob($directory.DIRECTORY_SEPARATOR.'*') ?: [] as $file) {
+            if (is_file($file) && (@filemtime($file) ?: 0) < $cutoff && @unlink($file)) {
+                $deleted++;
+            }
+        }
+
+        return $deleted;
+    }
+
+    protected function decompressedCopies(): array
+    {
+        return glob($this->decompressedDirectory().DIRECTORY_SEPARATOR.$this->decompressedPathPrefix().'-*.log') ?: [];
     }
 
     public function deleteDecompressedCopies(): void
@@ -177,9 +240,7 @@ trait CanDecompress
             return;
         }
 
-        $copies = glob($this->decompressedDirectory().DIRECTORY_SEPARATOR.$this->decompressedPathPrefix().'-*.log') ?: [];
-
-        foreach ($copies as $copy) {
+        foreach ($this->decompressedCopies() as $copy) {
             @unlink($copy);
         }
     }

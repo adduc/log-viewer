@@ -200,8 +200,9 @@ return [
     |--------------------------------------------------------------------------
     | Gzip-compressed log files (*.gz) are decompressed into this directory so
     | they can be indexed and browsed like regular log files. Copies are
-    | refreshed when the source changes and removed when the file's cache is
-    | cleared or the file is deleted. Defaults to
+    | refreshed when the source changes, pruned after a week without use, and
+    | removed when the file's cache is cleared or the file is deleted. Their
+    | size is included in the cache size shown in the UI. Defaults to
     | storage/framework/log-viewer/decompressed.
     |
     */

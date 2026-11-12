@@ -143,6 +143,10 @@ class LogViewerService
         if (! isset($this->_cachedFiles)) {
             $fileClass = static::$logFileClass;
 
+            // Listing files happens on most requests, so use it to expire
+            // decompressed copies of .gz logs that nobody has opened lately.
+            $fileClass::pruneDecompressedCopies();
+
             $this->_cachedFiles = (new LogFileCollection($this->getLaravelLogFilePaths()))
                 ->unique()
                 ->map(function ($filePath) use ($fileClass) {
