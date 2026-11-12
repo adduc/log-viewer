@@ -3,6 +3,9 @@
 namespace Opcodes\LogViewer\Concerns\LogFile;
 
 use Opcodes\LogViewer\Exceptions\CannotOpenFileException;
+use Opcodes\LogViewer\Exceptions\DecompressedFileTooLargeException;
+use Opcodes\LogViewer\Facades\Cache;
+use Opcodes\LogViewer\Utils\GenerateCacheKey;
 use Opcodes\LogViewer\Utils\Utils;
 
 /**
@@ -18,6 +21,10 @@ use Opcodes\LogViewer\Utils\Utils;
  * decompressed path, metadata and index cache keys are all derived from it.
  * A replaced archive (e.g. by logrotate) therefore gets a fresh copy and a
  * fresh, empty index rather than one that has to be detected and cleared.
+ *
+ * Decompression happens within the request that first opens the file, so
+ * copies are capped at `max_decompressed_file_size_in_mb` to keep that
+ * request within its time limit; see maxDecompressedSize().
  */
 trait CanDecompress
 {
@@ -115,40 +122,11 @@ trait CanDecompress
             return $scannedSize;
         }
 
-        return $this->estimatedUncompressedSize();
-    }
-
-    /**
-     * A display-only estimate for archives that have never been scanned, which
-     * avoids decompressing every archive just to list it. The gzip trailer's
-     * ISIZE is the size mod 2^32 of the last member only, so it understates
-     * archives over 4 GiB and multi-member (concatenated) archives. Readers never
-     * compare scan progress against it; see IndexedLogReader::requiresScan().
-     */
-    protected function estimatedUncompressedSize(): int
-    {
-        return max($this->gzipTrailerSize() ?? 0, @filesize($this->path) ?: 0);
-    }
-
-    protected function gzipTrailerSize(): ?int
-    {
-        $compressedSize = @filesize($this->path);
-
-        if (! $compressedSize || $compressedSize < 18) {
-            return null;
-        }
-
-        $handle = @fopen($this->path, 'rb');
-
-        if ($handle === false) {
-            return null;
-        }
-
-        fseek($handle, -4, SEEK_END);
-        $trailer = fread($handle, 4);
-        fclose($handle);
-
-        return strlen($trailer) === 4 ? unpack('V', $trailer)[1] : null;
+        // Never decompressed, so the real size is unknown. The archive's own size
+        // stands in, so unscanned archives still count as work remaining when
+        // scan progress is summed across files. Readers never compare scan
+        // positions against it; see IndexedLogReader::requiresScan().
+        return @filesize($this->path) ?: 0;
     }
 
     /**
@@ -272,6 +250,12 @@ trait CanDecompress
                 return $target;
             }
 
+            if ($this->exceedsDecompressedSizeLimit()) {
+                // An earlier attempt (possibly by a request we waited on) found
+                // this version too large; don't spend another request finding out.
+                throw $this->decompressedFileTooLargeException();
+            }
+
             // A fixed temp name (rather than a random one) means a decompression
             // killed mid-way leaves at most one leftover, which the next attempt
             // overwrites. Renaming into place means readers never see a partial copy.
@@ -322,12 +306,26 @@ trait CanDecompress
             throw new CannotOpenFileException('Could not write decompressed copy of "'.$this->path.'".');
         }
 
+        $limit = static::maxDecompressedSize();
+        $written = 0;
+
         try {
             while (! gzeof($source)) {
                 $chunk = gzread($source, 1024 * 1024);
 
                 if ($chunk === false) {
                     throw new CannotOpenFileException('Could not decompress "'.$this->path.'". Is it a valid gzip file?');
+                }
+
+                $written += strlen($chunk);
+
+                if ($limit !== null && $written > $limit) {
+                    // Remember the limit this version went over, so later requests
+                    // fail fast instead of decompressing it again, until the limit
+                    // is raised or the archive is replaced (a new signature).
+                    Cache::put($this->decompressedSizeExceededCacheKey(), $limit, $this->cacheTtl());
+
+                    throw $this->decompressedFileTooLargeException();
                 }
 
                 // A short write (e.g. disk full) must not be renamed into place: the
@@ -355,6 +353,54 @@ trait CanDecompress
         } finally {
             gzclose($source);
         }
+    }
+
+    /**
+     * The largest decompressed copy allowed, in bytes, or null for no limit.
+     */
+    public static function maxDecompressedSize(): ?int
+    {
+        $megabytes = config('log-viewer.max_decompressed_file_size_in_mb');
+
+        if (! is_numeric($megabytes) || $megabytes <= 0) {
+            return null;
+        }
+
+        return (int) ($megabytes * 1024 * 1024);
+    }
+
+    /**
+     * Whether this version of the archive is known to decompress to more than
+     * the current limit. Only an earlier decompression attempt can tell, so this
+     * is false for archives that haven't been tried yet.
+     */
+    public function exceedsDecompressedSizeLimit(): bool
+    {
+        $limit = static::maxDecompressedSize();
+
+        if (! $this->isCompressed() || $limit === null) {
+            return false;
+        }
+
+        $exceededLimit = Cache::get($this->decompressedSizeExceededCacheKey());
+
+        return $exceededLimit !== null && $limit <= $exceededLimit;
+    }
+
+    protected function decompressedSizeExceededCacheKey(): string
+    {
+        // Includes the source signature, so a replaced archive is tried afresh.
+        return GenerateCacheKey::for($this, 'decompressed-size-exceeded');
+    }
+
+    protected function decompressedFileTooLargeException(): DecompressedFileTooLargeException
+    {
+        return new DecompressedFileTooLargeException(sprintf(
+            '"%s" is too large to view: it decompresses to more than %s. '
+            .'Raise "log-viewer.max_decompressed_file_size_in_mb" to allow it.',
+            $this->name,
+            Utils::bytesForHumans(static::maxDecompressedSize() ?? 0),
+        ));
     }
 
     /**

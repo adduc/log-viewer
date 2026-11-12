@@ -37,7 +37,7 @@ trait PreservesIndexingProgress
 
     public function incomplete(): bool
     {
-        return $this->file->size() !== $this->getLastScannedFilePosition();
+        return $this->file->contentSize() !== $this->getLastScannedFilePosition();
     }
 
     public function markForRebuild(): void

@@ -212,6 +212,22 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Maximum decompressed file size
+    |--------------------------------------------------------------------------
+    | Gzip-compressed log files are decompressed during the first request
+    | that opens them, so a very large archive can exceed the request's time
+    | limit and use a lot of disk. Archives that decompress to more than this
+    | many megabytes are not decompressed; an error is shown instead. The
+    | limit applies to the decompressed size, because compression ratios
+    | vary widely. As a rough guide, 8 GB decompresses in about 10 seconds
+    | on a modern server. Set to null to disable the limit.
+    |
+    */
+
+    'max_decompressed_file_size_in_mb' => 8192,
+
+    /*
+    |--------------------------------------------------------------------------
     | Exclude file patterns.
     |--------------------------------------------------------------------------
     | This will take precedence over included files.

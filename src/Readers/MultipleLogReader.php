@@ -99,7 +99,7 @@ class MultipleLogReader
         $totalCounts = [];
 
         /** @var LogFile $file */
-        foreach ($this->fileCollection as $file) {
+        foreach ($this->readableFiles() as $file) {
             foreach ($this->getLogQueryForFile($file)->getLevelCounts() as $levelCount) {
                 $level = $levelCount->level->value;
 
@@ -116,7 +116,7 @@ class MultipleLogReader
 
     public function total(): int
     {
-        return $this->fileCollection->sum(function (LogFile $file) {
+        return $this->readableFiles()->sum(function (LogFile $file) {
             return $this->getLogQueryForFile($file)->total();
         });
     }
@@ -155,7 +155,7 @@ class MultipleLogReader
         // Third, keep an eye on the limit. Once we have the X number of logs, exit early.
 
         /** @var LogFile $file */
-        foreach ($this->fileCollection as $file) {
+        foreach ($this->readableFiles() as $file) {
             $logQuery = $this->getLogQueryForFile($file);
 
             if (isset($skip)) {
@@ -183,21 +183,21 @@ class MultipleLogReader
 
     public function requiresScan(): bool
     {
-        return $this->fileCollection->some(function (LogFile $file) {
+        return $this->readableFiles()->some(function (LogFile $file) {
             return $this->getLogQueryForFile($file)->requiresScan();
         });
     }
 
     public function percentScanned(): int
     {
-        $totalFileBytes = $this->fileCollection->sum->size();
+        $totalFileBytes = $this->readableFiles()->sum->contentSize();
 
         if ($totalFileBytes <= 0) {
             // empty files, so assume they've been fully scanned
             return 100;
         }
 
-        $missingScansBytes = $this->fileCollection->sum(function (LogFile $file) {
+        $missingScansBytes = $this->readableFiles()->sum(function (LogFile $file) {
             return $this->getLogQueryForFile($file)->numberOfNewBytes();
         });
 
@@ -233,6 +233,18 @@ class MultipleLogReader
                 break;
             }
         }
+    }
+
+    /**
+     * Files that can be read. Compressed files known to exceed the decompressed
+     * size limit are left out, so one oversized archive doesn't break a search
+     * across all files. scan() still tries every file, which is how they're found.
+     */
+    protected function readableFiles(): LogFileCollection
+    {
+        return $this->fileCollection->reject(
+            fn (LogFile $file) => $file->exceedsDecompressedSizeLimit()
+        );
     }
 
     protected function getLogQueryForFile(LogFile $file): LogReaderInterface

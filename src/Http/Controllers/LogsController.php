@@ -4,6 +4,7 @@ namespace Opcodes\LogViewer\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
+use Opcodes\LogViewer\Exceptions\DecompressedFileTooLargeException;
 use Opcodes\LogViewer\Exceptions\InvalidRegularExpression;
 use Opcodes\LogViewer\Facades\LogViewer;
 use Opcodes\LogViewer\Http\Resources\LevelCountResource;
@@ -77,6 +78,9 @@ class LogsController
                 $percentScanned = $logQuery->percentScanned();
             } catch (InvalidRegularExpression $exception) {
                 $queryError = $exception->getMessage();
+            } catch (DecompressedFileTooLargeException $exception) {
+                // Shown by the UI as HTML, so escape the file name in the message.
+                $error = e($exception->getMessage());
             }
         }
 
@@ -104,6 +108,7 @@ class LogsController
             'cacheRecentlyCleared' => $this->cacheRecentlyCleared ?? false,
             'hasMoreResults' => $hasMoreResults,
             'percentScanned' => $percentScanned,
+            'error' => $error ?? null,
             'performance' => $this->getRequestPerformanceInfo(),
         ]);
     }

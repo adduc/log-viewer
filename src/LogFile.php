@@ -92,15 +92,31 @@ class LogFile
         return $logReaderClass::instance($this);
     }
 
+    /**
+     * Size of the file on disk, in bytes. For a compressed file this is the
+     * size of the archive itself; see contentSize() for the log contents.
+     */
     public function size(): int
     {
         clearstatcache();
 
+        return filesize($this->path);
+    }
+
+    /**
+     * Size of the plain-text log contents, in bytes. Byte offsets in the log
+     * index refer to these contents, so readers compare scan progress against
+     * this rather than size(). The two differ only for compressed files.
+     */
+    public function contentSize(): int
+    {
         if ($this->isCompressed()) {
+            clearstatcache();
+
             return $this->uncompressedSize();
         }
 
-        return filesize($this->path);
+        return $this->size();
     }
 
     public function sizeInMB(): float

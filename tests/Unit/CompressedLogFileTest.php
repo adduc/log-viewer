@@ -2,11 +2,14 @@
 
 use Illuminate\Support\Facades\File;
 use Opcodes\LogViewer\Exceptions\CannotOpenFileException;
+use Opcodes\LogViewer\Exceptions\DecompressedFileTooLargeException;
 use Opcodes\LogViewer\Facades\LogViewer;
 use Opcodes\LogViewer\LogFile;
 use Opcodes\LogViewer\Logs\LogType;
 use Opcodes\LogViewer\Readers\IndexedLogReader;
 use Opcodes\LogViewer\Utils\Utils;
+
+use function Pest\Laravel\getJson;
 
 beforeEach(function () {
     config(['log-viewer.decompressed_files_path' => storage_path('logs-decompressed-test')]);
@@ -34,10 +37,12 @@ it('reads logs from a gzip-compressed file', function () {
 
     expect($file->isCompressed())->toBeTrue()
         ->and($file->type()->value)->toBe(LogType::LARAVEL)
-        ->and($file->size())->toBe(strlen($content));
+        ->and($file->size())->toBe(filesize($file->path));
 
     $file->logs()->scan();
     $logs = $file->logs()->get();
+
+    expect($file->contentSize())->toBe(strlen($content));
 
     expect($file->logs()->requiresScan())->toBeFalse()
         ->and($logs)->toHaveCount(3)
@@ -57,11 +62,13 @@ it('can search within a gzip-compressed file', function () {
         ->and($logs[0]->message)->toBe('needle here');
 });
 
-it('guesses the size from the gzip trailer without decompressing', function () {
+it('reports the size of the archive without decompressing it', function () {
     $content = str_repeat(makeLaravelLogEntry().PHP_EOL, 100);
     $file = generateGzipLogFile('laravel.log.3.gz', $content);
 
-    expect($file->size())->toBe(strlen($content))
+    expect($file->size())->toBe(filesize($file->path))
+        ->and($file->size())->toBeLessThan(strlen($content))
+        ->and($file->sizeFormatted())->toBe(Utils::bytesForHumans(filesize($file->path)))
         ->and(glob(LogFile::decompressedDirectory().'/*'))->toBeEmpty();
 });
 
@@ -303,7 +310,7 @@ it('keeps the exact size of a multi-member archive after its copy is pruned', fu
     IndexedLogReader::clearInstances();
     $file = new LogFile($path);
 
-    expect($file->size())->toBe(strlen($first.$second))
+    expect($file->contentSize())->toBe(strlen($first.$second))
         ->and($file->logs()->requiresScan())->toBeFalse()
         ->and(glob(LogFile::decompressedDirectory().'/*.log'))->toBeEmpty();
 });
@@ -361,3 +368,93 @@ function expectedDecompressedPath(LogFile $file): string
     return LogFile::decompressedDirectory().DIRECTORY_SEPARATOR
         .sprintf('%s-%d-%d.log', Utils::shortMd5($file->path), filemtime($file->path), filesize($file->path));
 }
+
+/**
+ * Content just over 1 KB once decompressed; with a 1 KB limit it's too large.
+ */
+function generateOversizedGzipLogFile(string $fileName): LogFile
+{
+    config(['log-viewer.max_decompressed_file_size_in_mb' => 1 / 1024]);
+
+    return generateGzipLogFile($fileName, str_repeat(makeLaravelLogEntry(message: 'big').PHP_EOL, 30));
+}
+
+it('refuses to decompress archives larger than the limit', function () {
+    $file = generateOversizedGzipLogFile('laravel.log.30.gz');
+
+    expect(fn () => $file->openForReading())->toThrow(DecompressedFileTooLargeException::class, 'decompresses to more than '.Utils::bytesForHumans(1024))
+        ->and($file->exceedsDecompressedSizeLimit())->toBeTrue()
+        ->and($file->logs()->requiresScan())->toBeFalse()
+        // Neither a copy nor the partial temp file is left behind.
+        ->and(glob(LogFile::decompressedDirectory().'/*.log*'))->toBeEmpty();
+});
+
+it('remembers that an archive is too large instead of decompressing it again', function () {
+    if (PHP_OS_FAMILY === 'Windows') {
+        $this->markTestSkipped('File permissions work differently on Windows.');
+    }
+
+    $file = generateOversizedGzipLogFile('laravel.log.31.gz');
+    expect(fn () => $file->openForReading())->toThrow(DecompressedFileTooLargeException::class);
+
+    // Decompressing again would now fail to open the archive instead.
+    chmod($file->path, 0333);
+    $file = new LogFile($file->path);
+
+    try {
+        expect(fn () => $file->openForReading())->toThrow(DecompressedFileTooLargeException::class);
+    } finally {
+        chmod($file->path, 0644);
+    }
+});
+
+it('decompresses a rejected archive once the limit is raised', function () {
+    $file = generateOversizedGzipLogFile('laravel.log.32.gz');
+    expect(fn () => $file->openForReading())->toThrow(DecompressedFileTooLargeException::class);
+
+    config(['log-viewer.max_decompressed_file_size_in_mb' => 1]);
+    $file = new LogFile($file->path);
+
+    expect($file->exceedsDecompressedSizeLimit())->toBeFalse()
+        ->and($file->logs()->requiresScan())->toBeTrue();
+    $file->logs()->scan();
+    expect($file->logs()->get())->toHaveCount(30);
+});
+
+it('applies no limit when it is disabled', function () {
+    $file = generateOversizedGzipLogFile('laravel.log.33.gz');
+    config(['log-viewer.max_decompressed_file_size_in_mb' => null]);
+
+    $file->logs()->scan();
+
+    expect(LogFile::maxDecompressedSize())->toBeNull()
+        ->and($file->logs()->get())->toHaveCount(30);
+});
+
+it('explains why an archive that is too large cannot be viewed', function () {
+    config(['log-viewer.include_files' => ['*.log', '*.log.*.gz']]);
+    $file = generateOversizedGzipLogFile('laravel.log.34.gz');
+
+    foreach ([1, 2] as $attempt) {
+        $response = getJson(route('log-viewer.logs', ['file' => $file->identifier]));
+
+        $response->assertOk();
+        expect($response->json('error'))->toContain('&quot;laravel.log.34.gz&quot; is too large to view')
+            ->and($response->json('logs'))->toBeEmpty()
+            ->and($response->json('hasMoreResults'))->toBeFalse();
+    }
+});
+
+it('leaves archives that are too large out of a search across all files', function () {
+    config(['log-viewer.include_files' => ['*.log', '*.log.*.gz']]);
+    generateOversizedGzipLogFile('laravel.log.35.gz');
+    generateLogFile('readable.log', makeLaravelLogEntry(message: 'big but readable'));
+
+    foreach ([1, 2] as $attempt) {
+        $response = getJson(route('log-viewer.logs', ['query' => 'big']));
+
+        $response->assertOk();
+        expect(collect($response->json('logs'))->pluck('message')->all())->toBe(['big but readable'])
+            ->and($response->json('hasMoreResults'))->toBeFalse();
+    }
+});

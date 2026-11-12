@@ -154,7 +154,7 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
 
         $this->file->setMetadata('name', $this->file->name);
         $this->file->setMetadata('path', $this->file->path);
-        $this->file->setMetadata('size', $this->file->size());
+        $this->file->setMetadata('size', $this->file->contentSize());
         // Use the local variables that track ALL logs scanned, not just those matching the query
         // This ensures file-level metadata represents the entire file, not filtered results
         if (isset($earliest_timestamp)) {
@@ -278,7 +278,7 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
             $lastScannedFilePosition = $this->index()->getLastScannedFilePosition();
         }
 
-        return $this->file->size() - $lastScannedFilePosition;
+        return $this->file->contentSize() - $lastScannedFilePosition;
     }
 
     public function requiresScan(): bool
@@ -288,9 +288,14 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
         // is reopened by prepareFileForReading().
         $this->file->refreshSourceSignature();
 
+        if ($this->file->exceedsDecompressedSizeLimit()) {
+            // It can't be decompressed, so scanning would only fail again.
+            return false;
+        }
+
         if ($this->file->isCompressed() && $this->file->getMetadata('size') === null) {
-            // Never scanned (or its metadata was evicted), so size() is only an
-            // estimate from the gzip trailer and can't be compared with scan progress.
+            // Never scanned (or its metadata was evicted), so the size of the
+            // contents is unknown and can't be compared with scan progress.
             return true;
         }
 
@@ -300,7 +305,7 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
         }
 
         // File metadata can outlive index cache entries; rebuild when the index was lost.
-        if ($this->file->size() > 0) {
+        if ($this->file->contentSize() > 0) {
             $index = $this->index();
 
             if ($index->getLastScannedFilePosition() === 0 && $index->count() === 0) {
@@ -321,12 +326,12 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
 
     public function percentScanned(): int
     {
-        if ($this->file->size() <= 0) {
+        if ($this->file->contentSize() <= 0) {
             // empty file, so assume it has been fully scanned.
             return 100;
         }
 
-        return 100 - intval(($this->numberOfNewBytes() / $this->file->size() * 100));
+        return 100 - intval(($this->numberOfNewBytes() / $this->file->contentSize() * 100));
     }
 
     protected function getLogAtIndex(int $index): ?Log
