@@ -76,7 +76,8 @@ class LogsController
                 $hasMoreResults = $logQuery->requiresScan();
                 $percentScanned = $logQuery->percentScanned();
             } catch (InvalidRegularExpression $exception) {
-                $queryError = $exception->getMessage();
+                // Shown below the search box as HTML, so escape the message.
+                $error = e($exception->getMessage());
             }
         }
 
@@ -104,6 +105,7 @@ class LogsController
             'cacheRecentlyCleared' => $this->cacheRecentlyCleared ?? false,
             'hasMoreResults' => $hasMoreResults,
             'percentScanned' => $percentScanned,
+            'error' => $error ?? null,
             'performance' => $this->getRequestPerformanceInfo(),
         ]);
     }

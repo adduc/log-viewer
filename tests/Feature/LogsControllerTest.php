@@ -90,3 +90,42 @@ test('logs can exclude full_text property when requested', function () {
     expect($response->json('logs'))->toHaveCount(1);
     expect($response->json('logs.0'))->not->toHaveKey('full_text');
 });
+
+test('an invalid search regex is reported as an error', function () {
+    $file = generateLogFile('invalid_regex.log', makeLaravelLogEntry(message: 'Test message'));
+
+    $response = getJson(route('log-viewer.logs', ['file' => $file->identifier, 'query' => 'Test (']));
+
+    $response->assertOk();
+    expect($response->json('error'))->toContain('missing closing parenthesis')
+        ->and($response->json('logs'))->toBeEmpty();
+});
+
+test('an invalid search regex is reported when searching all files', function () {
+    generateLogFile('invalid_regex_all.log', makeLaravelLogEntry(message: 'Test message'));
+
+    $response = getJson(route('log-viewer.logs', ['query' => 'Test (']));
+
+    $response->assertOk();
+    expect($response->json('error'))->toContain('missing closing parenthesis');
+});
+
+test('search regex errors are escaped, because the UI renders them as HTML', function () {
+    $file = generateLogFile('invalid_regex_html.log', makeLaravelLogEntry(message: 'Test message'));
+
+    // The query is wrapped in "~" delimiters, so this ends the pattern early
+    // and PHP reports the next character: "Unknown modifier '<'".
+    $response = getJson(route('log-viewer.logs', ['file' => $file->identifier, 'query' => 'x~<b']));
+
+    expect($response->json('error'))->toContain('Unknown modifier &#039;&lt;&#039;')
+        ->and($response->json('error'))->not->toContain('<');
+});
+
+test('a valid search has no error', function () {
+    $file = generateLogFile('valid_regex.log', makeLaravelLogEntry(message: 'Test message'));
+
+    $response = getJson(route('log-viewer.logs', ['file' => $file->identifier, 'query' => 'Test']));
+
+    expect($response->json('error'))->toBeNull()
+        ->and($response->json('logs'))->toHaveCount(1);
+});
