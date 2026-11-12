@@ -286,6 +286,31 @@ it('re-indexes a replaced gzip file in a long-lived reader with the old copy ope
         ->toBe(['new-1', 'new-2', 'new-3']);
 });
 
+it('keeps the reader direction and filters when the archive is replaced mid-request', function () {
+    $file = generateGzipLogFile('laravel.log.19.gz', makeLaravelLogEntry(message: 'old-a'));
+    $reader = $file->logs();
+    $reader->scan();
+
+    // e.g. LogsController: configure the query, then scan and paginate.
+    $reader->reverse()->exceptLevels(['debug'])->skip(1)->limit(2);
+
+    File::put($file->path, gzencode(implode(PHP_EOL, [
+        makeLaravelLogEntry(now()->subMinutes(4), 'info', 'new-1'),
+        makeLaravelLogEntry(now()->subMinutes(3), 'debug', 'new-2'),
+        makeLaravelLogEntry(now()->subMinutes(2), 'info', 'new-3'),
+        makeLaravelLogEntry(now()->subMinutes(1), 'info', 'new-4'),
+    ])));
+    touch($file->path, time() + 10);
+
+    expect($reader->requiresScan())->toBeTrue();
+    $reader->scan();
+
+    // Newest first, first result skipped, at most two.
+    expect(collect($reader->get())->pluck('message')->all())->toBe(['new-3', 'new-2'])
+        ->and($file->index()->isLevelSelected('debug'))->toBeFalse()
+        ->and($file->index()->isLevelSelected('info'))->toBeTrue();
+});
+
 it('keeps the exact size of a multi-member archive after its copy is pruned', function () {
     $first = str_repeat(makeLaravelLogEntry(message: 'first member').PHP_EOL, 20);
     $second = makeLaravelLogEntry(message: 'last');
