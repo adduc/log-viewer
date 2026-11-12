@@ -94,7 +94,8 @@ class LogTypeRegistrar
 
     public function guessTypeFromFileName(LogFile $file): ?string
     {
-        if ($this->isPossiblyLaravelLogFile($file->uncompressedName())) {
+        // Strip a rotation suffix too, e.g. "laravel.log.1.gz" -> "laravel.log".
+        if ($this->isPossiblyLaravelLogFile(preg_replace('/\.\d+$/', '', $file->uncompressedName()))) {
             return LogType::LARAVEL;
         } elseif (str_contains($file->name, 'php-fpm')) {
             return LogType::PHP_FPM;

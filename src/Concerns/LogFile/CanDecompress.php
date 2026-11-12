@@ -13,9 +13,16 @@ use Opcodes\LogViewer\Utils\Utils;
  * of reading the .gz file directly, we decompress it once into a plain-text
  * copy and point all readers at that copy. The copy is regenerated whenever
  * the source file's mtime or size changes.
+ *
+ * Each LogFile instance pins the source's "mtime-size" signature, and the
+ * decompressed path, metadata and index cache keys are all derived from it.
+ * A replaced archive (e.g. by logrotate) therefore gets a fresh copy and a
+ * fresh, empty index rather than one that has to be detected and cleared.
  */
 trait CanDecompress
 {
+    protected ?string $pinnedSourceSignature = null;
+
     public function isCompressed(): bool
     {
         return str_ends_with(strtolower($this->path), '.gz');
@@ -41,10 +48,11 @@ trait CanDecompress
             return $this->path;
         }
 
+        $this->refreshSourceSignature();
         $target = $this->decompressedPath();
 
         if (! is_file($target)) {
-            $this->decompressTo($target);
+            $target = $this->decompressTo($target);
         } elseif (filemtime($target) < time() - 3600) {
             // The copy's mtime records when it was last used, so pruning can find
             // copies nobody has opened recently. Only touch it hourly to avoid a
@@ -53,6 +61,36 @@ trait CanDecompress
         }
 
         return $target;
+    }
+
+    /**
+     * Open the plain-text contents for reading.
+     *
+     * Resolving the copy's path and opening it are separate steps, so another
+     * request can delete the copy in between: after decompressing a newer
+     * version of the archive, or when clearing the cache. Once opened, the copy
+     * stays readable even if it is unlinked, so only the open needs a retry.
+     *
+     * @return resource
+     *
+     * @throws CannotOpenFileException
+     */
+    public function openForReading()
+    {
+        for ($attempt = 1; ; $attempt++) {
+            $path = $this->readablePath();
+            $handle = @fopen($path, 'r');
+
+            if ($handle !== false) {
+                return $handle;
+            }
+
+            if (! $this->isCompressed() || $attempt >= 3) {
+                throw new CannotOpenFileException('Could not open "'.$this->path.'" for reading.');
+            }
+
+            clearstatcache(false, $path);
+        }
     }
 
     /**
@@ -68,10 +106,28 @@ trait CanDecompress
             return filesize($target);
         }
 
-        // The copy hasn't been made yet (e.g. we're just listing files). Avoid
-        // decompressing the whole file just to show its size; the last 4 bytes
-        // of a gzip file hold the uncompressed size (mod 2^32).
-        return $this->gzipTrailerSize() ?? filesize($this->path);
+        // The copy was pruned or hasn't been made yet (e.g. we're just listing
+        // files). Metadata is keyed by the source signature, so a size recorded
+        // by a scan is exact for this version of the archive.
+        $scannedSize = $this->getMetadata('size');
+
+        if ($scannedSize !== null) {
+            return $scannedSize;
+        }
+
+        return $this->estimatedUncompressedSize();
+    }
+
+    /**
+     * A display-only estimate for archives that have never been scanned, which
+     * avoids decompressing every archive just to list it. The gzip trailer's
+     * ISIZE is the size mod 2^32 of the last member only, so it understates
+     * archives over 4 GiB and multi-member (concatenated) archives. Readers never
+     * compare scan progress against it; see IndexedLogReader::requiresScan().
+     */
+    protected function estimatedUncompressedSize(): int
+    {
+        return max($this->gzipTrailerSize() ?? 0, @filesize($this->path) ?: 0);
     }
 
     protected function gzipTrailerSize(): ?int
@@ -109,8 +165,10 @@ trait CanDecompress
     }
 
     /**
-     * Identifies the current version of a compressed source file ("mtime-size"),
-     * or null for uncompressed files.
+     * The version ("mtime-size") of a compressed source file this instance works
+     * with, or null for uncompressed files. It is pinned on first use and only
+     * changes through refreshSourceSignature(), so cache keys and the copy's
+     * path stay consistent while a reader is using them.
      */
     public function sourceSignature(): ?string
     {
@@ -118,25 +176,41 @@ trait CanDecompress
             return null;
         }
 
-        clearstatcache(false, $this->path);
-
-        return sprintf('%d-%d', @filemtime($this->path) ?: 0, @filesize($this->path) ?: 0);
+        return $this->pinnedSourceSignature ??= $this->currentSourceSignature();
     }
 
     /**
-     * Whether a compressed source was replaced since it was last indexed (e.g. by
-     * logrotate). Archives are never appended to, so any change means the stored
-     * byte offsets are meaningless and the file must be re-indexed from scratch.
+     * Re-check the source file and switch to its current version. Archives are
+     * replaced rather than appended to, so a new version has its own cache keys
+     * and starts with an empty index. In-memory state belonging to the previous
+     * version is dropped, so it can't be written back under the new keys.
+     *
+     * @return bool Whether the source changed.
      */
-    public function sourceChangedSinceIndexing(): bool
+    public function refreshSourceSignature(): bool
     {
         if (! $this->isCompressed()) {
             return false;
         }
 
-        $indexed = $this->getMetadata('source_signature');
+        $previous = $this->pinnedSourceSignature;
+        $this->pinnedSourceSignature = $this->currentSourceSignature();
 
-        return $indexed !== null && $indexed !== $this->sourceSignature();
+        if ($previous === null || $previous === $this->pinnedSourceSignature) {
+            return false;
+        }
+
+        $this->_logIndexCache = [];
+        $this->loadMetadata();
+
+        return true;
+    }
+
+    protected function currentSourceSignature(): string
+    {
+        clearstatcache(false, $this->path);
+
+        return sprintf('%d-%d', @filemtime($this->path) ?: 0, @filesize($this->path) ?: 0);
     }
 
     protected function decompressedPathPrefix(): string
@@ -151,9 +225,12 @@ trait CanDecompress
     }
 
     /**
+     * @return string Path of the copy, which differs from $target if the source
+     *                was replaced while waiting for the lock.
+     *
      * @throws CannotOpenFileException
      */
-    protected function decompressTo(string $target): void
+    protected function decompressTo(string $target): string
     {
         $directory = dirname($target);
 
@@ -168,7 +245,12 @@ trait CanDecompress
         $lockPath = $directory.DIRECTORY_SEPARATOR.$this->decompressedPathPrefix().'.lock';
         $lock = @fopen($lockPath, 'c');
 
-        if ($lock === false || ! flock($lock, LOCK_EX)) {
+        if ($lock !== false && ! flock($lock, LOCK_EX)) {
+            fclose($lock);
+            $lock = false;
+        }
+
+        if ($lock === false) {
             throw new CannotOpenFileException('Could not lock "'.$lockPath.'" to decompress "'.$this->path.'".');
         }
 
@@ -176,11 +258,18 @@ trait CanDecompress
         @touch($lockPath);
 
         try {
+            // The source may have been replaced while we waited for the lock.
+            // Decompressing it under the old name would store the new contents
+            // under the old version's copy and cache keys.
+            if ($this->refreshSourceSignature()) {
+                $target = $this->decompressedPath();
+            }
+
             clearstatcache(false, $target);
 
             if (is_file($target)) {
                 // Another request finished decompressing while we waited for the lock.
-                return;
+                return $target;
             }
 
             // A fixed temp name (rather than a random one) means a decompression
@@ -189,14 +278,20 @@ trait CanDecompress
             $temp = $target.'.tmp';
             $this->writeDecompressedCopy($temp);
 
+            if ($this->currentSourceSignature() !== $this->sourceSignature()) {
+                @unlink($temp);
+                throw new CannotOpenFileException('"'.$this->path.'" was replaced while it was being decompressed. Please try again.');
+            }
+
             if (! @rename($temp, $target)) {
                 @unlink($temp);
                 throw new CannotOpenFileException('Could not move decompressed copy of "'.$this->path.'" into place.');
             }
 
             // Remove stale copies from previous versions of the source file. This
-            // happens after the rename and skips $target, so a concurrent reader
-            // that already resolved $target never finds it missing.
+            // happens after the rename and skips $target. A concurrent reader that
+            // resolved an older copy but hasn't opened it yet retries; see
+            // openForReading().
             $this->deleteDecompressedCopies(except: $target);
         } finally {
             flock($lock, LOCK_UN);
@@ -205,6 +300,8 @@ trait CanDecompress
 
         // Disk usage just grew, so this is a good time to drop unused copies.
         static::pruneDecompressedCopies();
+
+        return $target;
     }
 
     /**

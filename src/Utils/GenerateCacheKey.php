@@ -14,6 +14,13 @@ class GenerateCacheKey
 
         if ($object instanceof LogFile) {
             $key = self::baseKey().':file:'.$object->identifier;
+
+            // Compressed archives are replaced wholesale (e.g. by logrotate), never
+            // appended to. Keying on the version gives a replaced archive a fresh,
+            // empty index; the old version's entries expire with the cache TTL.
+            if ($signature = $object->sourceSignature()) {
+                $key .= ':'.$signature;
+            }
         }
 
         if ($object instanceof LogIndex) {

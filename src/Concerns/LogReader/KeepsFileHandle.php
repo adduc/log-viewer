@@ -10,6 +10,9 @@ trait KeepsFileHandle
     /** @var resource|null */
     protected $fileHandle = null;
 
+    /** Version of a compressed source the open handle belongs to (null for plain files). */
+    protected ?string $openedSourceSignature = null;
+
     protected function isFileOpen(): bool
     {
         return is_resource($this->fileHandle);
@@ -25,6 +28,13 @@ trait KeepsFileHandle
      */
     protected function prepareFileForReading(): void
     {
+        if ($this->isFileOpen() && $this->openedSourceSignature !== $this->file->sourceSignature()) {
+            // The file switched to a newer version of a compressed archive, so the
+            // cache keys now describe a copy this handle doesn't point at. This is
+            // a string comparison only; the source is re-checked at scan time.
+            $this->closeFile();
+        }
+
         if ($this->isFileClosed()) {
             $this->openFile();
         }
@@ -42,7 +52,8 @@ trait KeepsFileHandle
         }
 
         try {
-            $this->fileHandle = fopen($this->file->readablePath(), 'r');
+            $this->fileHandle = $this->file->openForReading();
+            $this->openedSourceSignature = $this->file->sourceSignature();
         } catch (\ErrorException $exception) {
             throw new CannotOpenFileException('Could not open "'.$this->file->path.'" for reading.', 0, $exception);
         }

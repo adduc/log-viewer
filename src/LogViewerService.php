@@ -10,8 +10,10 @@ use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\HtmlString;
 use Illuminate\Support\Str;
+use Opcodes\LogViewer\Facades\Cache;
 use Opcodes\LogViewer\Readers\IndexedLogReader;
 use Opcodes\LogViewer\Readers\LogReaderInterface;
+use Opcodes\LogViewer\Utils\GenerateCacheKey;
 use Opcodes\LogViewer\Utils\Utils;
 
 class LogViewerService
@@ -145,7 +147,11 @@ class LogViewerService
 
             // Listing files happens on most requests, so use it to expire
             // decompressed copies of .gz logs that nobody has opened lately.
-            $fileClass::pruneDecompressedCopies();
+            // Copies live for days, so checking hourly is plenty and avoids
+            // a directory scan on every request.
+            if (Cache::add(GenerateCacheKey::for('decompressed-copies:pruned'), true, now()->addHour())) {
+                $fileClass::pruneDecompressedCopies();
+            }
 
             $this->_cachedFiles = (new LogFileCollection($this->getLaravelLogFilePaths()))
                 ->unique()

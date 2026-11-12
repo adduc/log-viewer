@@ -134,7 +134,13 @@ class LogFile
 
     public function contents(): string
     {
-        return file_get_contents($this->readablePath());
+        $handle = $this->openForReading();
+
+        try {
+            return stream_get_contents($handle);
+        } finally {
+            fclose($handle);
+        }
     }
 
     public function getFirstLine(): string

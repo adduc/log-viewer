@@ -54,20 +54,16 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
             $maxBytesToScan = LogViewer::lazyScanChunkSize();
         }
 
-        if (! $this->requiresScan() && ! $force) {
+        if ($force) {
+            // requiresScan() normally does this.
+            $this->file->refreshSourceSignature();
+        } elseif (! $this->requiresScan()) {
             return $this;
         }
 
         if ($this->index()->requiresRebuild()) {
             // A partially-evicted index cannot be resumed (the scan position is at the end
             // of the file) or re-scanned in place (surviving chunks would duplicate entries).
-            $force = true;
-        }
-
-        if ($this->file->sourceChangedSinceIndexing()) {
-            // A compressed archive was replaced (e.g. by logrotate). Every index for
-            // this file (not just this query's) points into the old contents.
-            $this->file->clearIndexedData();
             $force = true;
         }
 
@@ -159,7 +155,6 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
         $this->file->setMetadata('name', $this->file->name);
         $this->file->setMetadata('path', $this->file->path);
         $this->file->setMetadata('size', $this->file->size());
-        $this->file->setMetadata('source_signature', $this->file->sourceSignature());
         // Use the local variables that track ALL logs scanned, not just those matching the query
         // This ensures file-level metadata represents the entire file, not filtered results
         if (isset($earliest_timestamp)) {
@@ -288,9 +283,14 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
 
     public function requiresScan(): bool
     {
-        if ($this->file->sourceChangedSinceIndexing()) {
-            // The archive was replaced; its uncompressed size may even be unchanged,
-            // so this can't be left to the byte-count comparison below.
+        // A replaced archive switches the file to new cache keys, whose empty
+        // index is picked up by the checks below. An open handle on the old copy
+        // is reopened by prepareFileForReading().
+        $this->file->refreshSourceSignature();
+
+        if ($this->file->isCompressed() && $this->file->getMetadata('size') === null) {
+            // Never scanned (or its metadata was evicted), so size() is only an
+            // estimate from the gzip trailer and can't be compared with scan progress.
             return true;
         }
 

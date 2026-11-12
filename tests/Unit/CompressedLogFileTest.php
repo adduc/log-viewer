@@ -256,6 +256,104 @@ it('does not keep a truncated copy when writing fails', function () {
     expect(file_get_contents($file->readablePath()))->toContain('Testing log entry');
 })->skip(! is_writable('/dev/full'), 'Requires /dev/full (Linux).');
 
+it('re-indexes a replaced gzip file in a long-lived reader with the old copy open', function () {
+    // Octane / queue workers keep the same LogFile and reader across requests.
+    $file = generateGzipLogFile('laravel.log.15.gz', implode(PHP_EOL, [
+        makeLaravelLogEntry(message: 'old-a'),
+        makeLaravelLogEntry(message: 'old-b'),
+    ]));
+    $reader = $file->logs();
+    $reader->scan();
+    expect($reader->get())->toHaveCount(2);
+
+    File::put($file->path, gzencode(implode(PHP_EOL, array_map(
+        fn ($i) => makeLaravelLogEntry(message: "new-$i"),
+        range(1, 3),
+    ))));
+    touch($file->path, time() + 10);
+
+    expect($reader->requiresScan())->toBeTrue();
+    $reader->scan();
+
+    expect(collect($reader->get())->pluck('message')->sort()->values()->all())
+        ->toBe(['new-1', 'new-2', 'new-3']);
+
+    // A fresh request sees the same, correct index without rescanning.
+    IndexedLogReader::clearInstances();
+    $file = new LogFile($file->path);
+    expect($file->logs()->requiresScan())->toBeFalse()
+        ->and(collect($file->logs()->get())->pluck('message')->sort()->values()->all())
+        ->toBe(['new-1', 'new-2', 'new-3']);
+});
+
+it('keeps the exact size of a multi-member archive after its copy is pruned', function () {
+    $first = str_repeat(makeLaravelLogEntry(message: 'first member').PHP_EOL, 20);
+    $second = makeLaravelLogEntry(message: 'last');
+    $path = storage_path('logs/laravel.log.16.gz');
+    // e.g. `cat a.gz b.gz`: the trailer only records the last member's size.
+    File::put($path, gzencode($first).gzencode($second));
+    $file = new LogFile($path);
+
+    // Unscanned: the size is only an estimate, so a scan is required regardless.
+    expect($file->logs()->requiresScan())->toBeTrue();
+    $file->logs()->scan();
+    expect($file->logs()->get())->toHaveCount(21);
+
+    $file->deleteDecompressedCopies();
+    IndexedLogReader::clearInstances();
+    $file = new LogFile($path);
+
+    expect($file->size())->toBe(strlen($first.$second))
+        ->and($file->logs()->requiresScan())->toBeFalse()
+        ->and(glob(LogFile::decompressedDirectory().'/*.log'))->toBeEmpty();
+});
+
+it('retries opening when the copy is deleted between resolving and opening it', function () {
+    $path = storage_path('logs/laravel.log.17.gz');
+    File::put($path, gzencode(makeLaravelLogEntry(message: 'still readable')));
+
+    // Simulates another request clearing the cache (or replacing the copy)
+    // right after this one resolved the path.
+    $file = new class($path) extends LogFile
+    {
+        public bool $raced = false;
+
+        public function readablePath(): string
+        {
+            $resolved = parent::readablePath();
+
+            if (! $this->raced) {
+                $this->raced = true;
+                unlink($resolved);
+            }
+
+            return $resolved;
+        }
+    };
+
+    expect($file->contents())->toContain('still readable')
+        ->and($file->raced)->toBeTrue();
+});
+
+it('detects rotated laravel archives by file name', function () {
+    // The first line isn't a log entry, so guessing from it would fail.
+    $file = generateGzipLogFile('laravel.log.18.gz', 'not a log header'.PHP_EOL.makeLaravelLogEntry());
+
+    expect($file->type()->value)->toBe(LogType::LARAVEL);
+});
+
+it('prunes decompressed copies at most once an hour when listing files', function () {
+    $file = generateGzipLogFile('laravel.log.19.gz', makeLaravelLogEntry());
+    LogViewer::getFiles();
+
+    $copy = $file->readablePath();
+    touch($copy, time() - LogFile::decompressedCopyTtl() - 60);
+    LogViewer::clearFileCache();
+    LogViewer::getFiles();
+
+    expect(file_exists($copy))->toBeTrue();
+});
+
 function expectedDecompressedPath(LogFile $file): string
 {
     clearstatcache();
