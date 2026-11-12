@@ -101,14 +101,42 @@ trait CanDecompress
      */
     protected function decompressedPath(): string
     {
+        return $this->decompressedDirectory().DIRECTORY_SEPARATOR.sprintf(
+            '%s-%s.log',
+            $this->decompressedPathPrefix(),
+            $this->sourceSignature(),
+        );
+    }
+
+    /**
+     * Identifies the current version of a compressed source file ("mtime-size"),
+     * or null for uncompressed files.
+     */
+    public function sourceSignature(): ?string
+    {
+        if (! $this->isCompressed()) {
+            return null;
+        }
+
         clearstatcache(false, $this->path);
 
-        return $this->decompressedDirectory().DIRECTORY_SEPARATOR.sprintf(
-            '%s-%d-%d.log',
-            $this->decompressedPathPrefix(),
-            @filemtime($this->path) ?: 0,
-            @filesize($this->path) ?: 0,
-        );
+        return sprintf('%d-%d', @filemtime($this->path) ?: 0, @filesize($this->path) ?: 0);
+    }
+
+    /**
+     * Whether a compressed source was replaced since it was last indexed (e.g. by
+     * logrotate). Archives are never appended to, so any change means the stored
+     * byte offsets are meaningless and the file must be re-indexed from scratch.
+     */
+    public function sourceChangedSinceIndexing(): bool
+    {
+        if (! $this->isCompressed()) {
+            return false;
+        }
+
+        $indexed = $this->getMetadata('source_signature');
+
+        return $indexed !== null && $indexed !== $this->sourceSignature();
     }
 
     protected function decompressedPathPrefix(): string
@@ -133,15 +161,63 @@ trait CanDecompress
             throw new CannotOpenFileException('Could not create directory "'.$directory.'" for decompressed log files.');
         }
 
+        // Serialize decompression of this source across requests. Otherwise every
+        // request arriving during a slow decompression starts its own, and any of
+        // them killed by max_execution_time (which skips catch/finally) would leave
+        // a large temp file behind. The OS releases the lock if the process dies.
+        $lockPath = $directory.DIRECTORY_SEPARATOR.$this->decompressedPathPrefix().'.lock';
+        $lock = @fopen($lockPath, 'c');
+
+        if ($lock === false || ! flock($lock, LOCK_EX)) {
+            throw new CannotOpenFileException('Could not lock "'.$lockPath.'" to decompress "'.$this->path.'".');
+        }
+
+        // Keep the lock's mtime fresh so pruning never removes a lock in use.
+        @touch($lockPath);
+
+        try {
+            clearstatcache(false, $target);
+
+            if (is_file($target)) {
+                // Another request finished decompressing while we waited for the lock.
+                return;
+            }
+
+            // A fixed temp name (rather than a random one) means a decompression
+            // killed mid-way leaves at most one leftover, which the next attempt
+            // overwrites. Renaming into place means readers never see a partial copy.
+            $temp = $target.'.tmp';
+            $this->writeDecompressedCopy($temp);
+
+            if (! @rename($temp, $target)) {
+                @unlink($temp);
+                throw new CannotOpenFileException('Could not move decompressed copy of "'.$this->path.'" into place.');
+            }
+
+            // Remove stale copies from previous versions of the source file. This
+            // happens after the rename and skips $target, so a concurrent reader
+            // that already resolved $target never finds it missing.
+            $this->deleteDecompressedCopies(except: $target);
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+
+        // Disk usage just grew, so this is a good time to drop unused copies.
+        static::pruneDecompressedCopies();
+    }
+
+    /**
+     * @throws CannotOpenFileException
+     */
+    protected function writeDecompressedCopy(string $temp): void
+    {
         $source = @gzopen($this->path, 'rb');
 
         if ($source === false) {
             throw new CannotOpenFileException('Could not open "'.$this->path.'" for decompression.');
         }
 
-        // Write to a temporary file first and rename it into place, so concurrent
-        // requests never see a partially written copy.
-        $temp = $target.'.'.bin2hex(random_bytes(4)).'.tmp';
         $destination = @fopen($temp, 'wb');
 
         if ($destination === false) {
@@ -157,26 +233,31 @@ trait CanDecompress
                     throw new CannotOpenFileException('Could not decompress "'.$this->path.'". Is it a valid gzip file?');
                 }
 
-                fwrite($destination, $chunk);
+                // A short write (e.g. disk full) must not be renamed into place: the
+                // copy's name is tied to the source version, so a truncated copy
+                // would never be regenerated.
+                if (@fwrite($destination, $chunk) !== strlen($chunk)) {
+                    throw new CannotOpenFileException('Could not write decompressed copy of "'.$this->path.'". Is the disk full?');
+                }
+            }
+
+            // fclose() flushes buffered data, so it can fail for the same reasons.
+            $closed = fclose($destination);
+            $destination = null;
+
+            if (! $closed) {
+                throw new CannotOpenFileException('Could not write decompressed copy of "'.$this->path.'". Is the disk full?');
             }
         } catch (\Throwable $e) {
-            fclose($destination);
-            gzclose($source);
+            if (is_resource($destination)) {
+                fclose($destination);
+            }
             @unlink($temp);
 
             throw $e;
+        } finally {
+            gzclose($source);
         }
-
-        fclose($destination);
-        gzclose($source);
-
-        // Remove stale copies from previous versions of the source file.
-        $this->deleteDecompressedCopies();
-
-        rename($temp, $target);
-
-        // Disk usage just grew, so this is a good time to drop unused copies.
-        static::pruneDecompressedCopies();
     }
 
     /**
@@ -204,8 +285,12 @@ trait CanDecompress
     }
 
     /**
-     * Delete decompressed copies (and leftover temp files from interrupted
-     * decompressions) that have not been used within the TTL.
+     * Delete decompressed copies (plus leftover temp and lock files) that have
+     * not been used within the TTL.
+     *
+     * Only files whose names match what this trait creates are considered, so a
+     * `decompressed_files_path` pointed at a shared directory never loses
+     * unrelated files.
      *
      * @return int Number of files deleted.
      */
@@ -221,7 +306,12 @@ trait CanDecompress
         $deleted = 0;
 
         foreach (glob($directory.DIRECTORY_SEPARATOR.'*') ?: [] as $file) {
-            if (is_file($file) && (@filemtime($file) ?: 0) < $cutoff && @unlink($file)) {
+            if (
+                static::isDecompressedArtifact(basename($file))
+                && is_file($file)
+                && (@filemtime($file) ?: 0) < $cutoff
+                && @unlink($file)
+            ) {
                 $deleted++;
             }
         }
@@ -229,19 +319,30 @@ trait CanDecompress
         return $deleted;
     }
 
+    /**
+     * Whether a file name is one this trait creates: a copy ("<hash>-<mtime>-<size>.log"),
+     * its temp file ("<copy>.tmp"), or a per-source lock ("<hash>.lock").
+     */
+    protected static function isDecompressedArtifact(string $fileName): bool
+    {
+        return preg_match('/^[0-9a-f]+(?:-\d+-\d+\.log(?:\.tmp)?|\.lock)$/', $fileName) === 1;
+    }
+
     protected function decompressedCopies(): array
     {
         return glob($this->decompressedDirectory().DIRECTORY_SEPARATOR.$this->decompressedPathPrefix().'-*.log') ?: [];
     }
 
-    public function deleteDecompressedCopies(): void
+    public function deleteDecompressedCopies(?string $except = null): void
     {
         if (! $this->isCompressed()) {
             return;
         }
 
         foreach ($this->decompressedCopies() as $copy) {
-            @unlink($copy);
+            if ($copy !== $except) {
+                @unlink($copy);
+            }
         }
     }
 }

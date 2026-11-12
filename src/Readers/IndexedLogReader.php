@@ -64,6 +64,13 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
             $force = true;
         }
 
+        if ($this->file->sourceChangedSinceIndexing()) {
+            // A compressed archive was replaced (e.g. by logrotate). Every index for
+            // this file (not just this query's) points into the old contents.
+            $this->file->clearIndexedData();
+            $force = true;
+        }
+
         if ($this->numberOfNewBytes() < 0) {
             // the file reduced in size... something must've gone wrong, so let's
             // force a full re-index.
@@ -152,6 +159,7 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
         $this->file->setMetadata('name', $this->file->name);
         $this->file->setMetadata('path', $this->file->path);
         $this->file->setMetadata('size', $this->file->size());
+        $this->file->setMetadata('source_signature', $this->file->sourceSignature());
         // Use the local variables that track ALL logs scanned, not just those matching the query
         // This ensures file-level metadata represents the entire file, not filtered results
         if (isset($earliest_timestamp)) {
@@ -280,6 +288,12 @@ class IndexedLogReader extends BaseLogReader implements LogReaderInterface
 
     public function requiresScan(): bool
     {
+        if ($this->file->sourceChangedSinceIndexing()) {
+            // The archive was replaced; its uncompressed size may even be unchanged,
+            // so this can't be left to the byte-count comparison below.
+            return true;
+        }
+
         if ($this->index()->requiresRebuild()) {
             // A cached index chunk was lost; rebuild on the next scan.
             return true;

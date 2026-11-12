@@ -16,6 +16,17 @@ trait CanCacheData
 
     public function clearCache(): void
     {
+        $this->clearIndexedData();
+
+        $this->deleteDecompressedCopies();
+    }
+
+    /**
+     * Forget all indices and metadata for this file, keeping any decompressed
+     * copy on disk (it may be open by the reader that is about to re-index it).
+     */
+    public function clearIndexedData(): void
+    {
         foreach ($this->getMetadata('related_indices', []) as $indexIdentifier => $indexMetadata) {
             $this->index($indexMetadata['query'])->clearCache();
         }
@@ -29,7 +40,9 @@ trait CanCacheData
 
         $this->index()->clearCache();
 
-        $this->deleteDecompressedCopies();
+        // Drop the in-memory copy too, so stale values (e.g. timestamps or
+        // scan positions) aren't written back by the next saveMetadata().
+        $this->metadata = [];
     }
 
     public function cacheSize(): int
