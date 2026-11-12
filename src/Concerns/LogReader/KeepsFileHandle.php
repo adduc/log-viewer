@@ -42,7 +42,7 @@ trait KeepsFileHandle
         }
 
         try {
-            $this->fileHandle = fopen($this->file->path, 'r');
+            $this->fileHandle = fopen($this->file->readablePath(), 'r');
         } catch (\ErrorException $exception) {
             throw new CannotOpenFileException('Could not open "'.$this->file->path.'" for reading.', 0, $exception);
         }

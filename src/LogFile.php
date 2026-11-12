@@ -15,6 +15,7 @@ use Symfony\Component\HttpFoundation\BinaryFileResponse;
 class LogFile
 {
     use Concerns\LogFile\CanCacheData;
+    use Concerns\LogFile\CanDecompress;
     use Concerns\LogFile\HasMetadata;
 
     public string $path;
@@ -95,6 +96,10 @@ class LogFile
     {
         clearstatcache();
 
+        if ($this->isCompressed()) {
+            return $this->uncompressedSize();
+        }
+
         return filesize($this->path);
     }
 
@@ -129,7 +134,7 @@ class LogFile
 
     public function contents(): string
     {
-        return file_get_contents($this->path);
+        return file_get_contents($this->readablePath());
     }
 
     public function getFirstLine(): string
@@ -139,19 +144,25 @@ class LogFile
 
     public function getNthLine(int $lineNumber): string
     {
+        // gzopen() transparently reads plain files too, and lets us peek at the
+        // first lines of a compressed file without decompressing all of it.
         try {
-            $handle = fopen($this->path, 'r');
+            $handle = $this->isCompressed() ? gzopen($this->path, 'rb') : fopen($this->path, 'r');
         } catch (\ErrorException $e) {
             throw new CannotOpenFileException('Could not open "'.$this->path.'" for reading.', 0, $e);
         }
 
+        if ($handle === false) {
+            throw new CannotOpenFileException('Could not open "'.$this->path.'" for reading.');
+        }
+
         $line = '';
         for ($i = 0; $i < $lineNumber; $i++) {
-            $line = fgets($handle);
+            $line = $this->isCompressed() ? gzgets($handle) : fgets($handle);
         }
-        fclose($handle);
+        $this->isCompressed() ? gzclose($handle) : fclose($handle);
 
-        return $line;
+        return $line === false ? '' : $line;
     }
 
     public function addRelatedIndex(LogIndex $logIndex): void
@@ -212,6 +223,7 @@ class LogFile
     public function delete(): void
     {
         $this->clearCache();
+        $this->deleteDecompressedCopies();
         unlink($this->path);
         LogFileDeleted::dispatch($this);
     }

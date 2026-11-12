@@ -185,8 +185,28 @@ return [
         '/opt/homebrew/var/log/redis*log',
         '/opt/homebrew/var/log/supervisor*log',
 
+        // Gzip-compressed logs (e.g. rotated by logrotate) are supported too.
+        // They are decompressed once into `decompressed_files_path` for viewing.
+        // '*.log.gz',      // e.g. laravel-2026-11-01.log.gz
+        // '*.log.*.gz',    // e.g. laravel.log.1.gz
+        // '/var/log/nginx/*.gz' => 'Nginx (archived)',
+
         // '/absolute/paths/supported',
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Decompressed files path
+    |--------------------------------------------------------------------------
+    | Gzip-compressed log files (*.gz) are decompressed into this directory so
+    | they can be indexed and browsed like regular log files. Copies are
+    | refreshed when the source changes and removed when the file's cache is
+    | cleared or the file is deleted. Defaults to
+    | storage/framework/log-viewer/decompressed.
+    |
+    */
+
+    'decompressed_files_path' => null,
 
     /*
     |--------------------------------------------------------------------------

@@ -28,6 +28,8 @@ trait CanCacheData
         Cache::forget($this->relatedCacheKeysKey());
 
         $this->index()->clearCache();
+
+        $this->deleteDecompressedCopies();
     }
 
     public function cacheSize(): int
