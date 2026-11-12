@@ -31,6 +31,25 @@ class LogIndex
         $this->loadMetadata();
     }
 
+    /**
+     * Take over the reader-facing settings (direction, filters, pagination) of
+     * another index of the same query. Used when a replaced archive gets a fresh
+     * index mid-request, so the reader's choices aren't silently reset.
+     * The indexed data itself is not copied; it belongs to the old version.
+     */
+    public function copyQuerySettingsFrom(LogIndex $other): self
+    {
+        $this->direction = $other->direction;
+        $this->filterFrom = $other->filterFrom;
+        $this->filterTo = $other->filterTo;
+        $this->includeLevels = $other->includeLevels;
+        $this->excludeLevels = $other->excludeLevels;
+        $this->skip = $other->skip;
+        $this->limit = $other->limit;
+
+        return $this;
+    }
+
     public function addToIndex(int $filePosition, int|CarbonInterface $timestamp, string $severity, ?int $index = null): int
     {
         $logIndex = $index ?? $this->nextLogIndexToCreate ?? 0;

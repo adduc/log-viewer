@@ -58,9 +58,14 @@ trait CanDecompress
         $this->refreshSourceSignature();
         $target = $this->decompressedPath();
 
-        if (! is_file($target)) {
+        // A single suppressed stat rather than is_file() + filemtime(): another
+        // request may delete the copy in between, and an unsuppressed warning
+        // would become an ErrorException under Laravel.
+        $lastUsed = @filemtime($target);
+
+        if ($lastUsed === false) {
             $target = $this->decompressTo($target);
-        } elseif (filemtime($target) < time() - 3600) {
+        } elseif ($lastUsed < time() - 3600) {
             // The copy's mtime records when it was last used, so pruning can find
             // copies nobody has opened recently. Only touch it hourly to avoid a
             // filesystem write on every request.
@@ -107,10 +112,12 @@ trait CanDecompress
      */
     protected function uncompressedSize(): int
     {
-        $target = $this->decompressedPath();
+        // Suppressed, not guarded by is_file(): the copy can be deleted by
+        // another request between the check and the read. See readablePath().
+        $copySize = @filesize($this->decompressedPath());
 
-        if (is_file($target)) {
-            return filesize($target);
+        if ($copySize !== false) {
+            return $copySize;
         }
 
         // The copy was pruned or hasn't been made yet (e.g. we're just listing
@@ -178,8 +185,16 @@ trait CanDecompress
             return false;
         }
 
+        // Readers keep their direction, filters and pagination on the index
+        // (they re-fetch it via index() on every call), so carry those over to
+        // the new version's indices instead of silently resetting them.
+        $previousIndices = $this->_logIndexCache ?? [];
         $this->_logIndexCache = [];
         $this->loadMetadata();
+
+        foreach ($previousIndices as $query => $previousIndex) {
+            $this->index((string) $query)->copyQuerySettingsFrom($previousIndex);
+        }
 
         return true;
     }
